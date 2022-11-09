@@ -9,10 +9,12 @@ import (
 )
 
 type Gonk[dataType Evaluable[dataType]] struct {
-	backing unsafe.Pointer
-	sorter  slices.Order[BackingData[dataType]]
-	mu      sync.RWMutex
-	growing atomic.Uint32
+	backing         unsafe.Pointer
+	sorter          slices.Order[BackingData[dataType]]
+	mu              sync.RWMutex
+	growing         atomic.Uint32
+	growstrategy    GrowStrategy
+	reindexstrategy ReindexStrategy
 }
 
 type Evaluable[dataType any] interface {
@@ -32,12 +34,57 @@ type BackingData[dataType Evaluable[dataType]] struct {
 	item  dataType
 }
 
+type GrowStrategy uint8
+
+const (
+	Double GrowStrategy = iota
+	Half
+	HalfMax2048
+	OneAtATime
+	FourItems
+)
+
+type ReindexStrategy uint8
+
+const (
+	Adaptive ReindexStrategy = iota
+	OnGet
+)
+
+func (g *Gonk[dataType]) Init(preloadSize int) {
+	oldBacking := g.getBacking()
+	if oldBacking != nil {
+		// That's too late
+		return
+	}
+	g.mu.Lock()
+	newBacking := Backing[dataType]{
+		data: make([]BackingData[dataType], preloadSize),
+	}
+	if atomic.CompareAndSwapPointer(&g.backing, unsafe.Pointer(uintptr(0)), unsafe.Pointer(&newBacking)) {
+		g.init()
+	}
+	g.mu.Unlock()
+}
+
 func (g *Gonk[dataType]) init() {
 	g.sorter = slices.Order[BackingData[dataType]]{
 		RefLess: func(a, b *BackingData[dataType]) bool {
 			return a.item.LessThan(b.item)
 		},
 	}
+}
+
+func (g *Gonk[dataType]) GrowStrategy(gs GrowStrategy) {
+	g.mu.Lock()
+	g.growstrategy = gs
+	g.mu.Unlock()
+}
+
+func (g *Gonk[dataType]) ReindexStrategy(rs ReindexStrategy) {
+	g.mu.Lock()
+	g.reindexstrategy = rs
+	g.mu.Unlock()
 }
 
 func (g *Gonk[dataType]) Range(af func(item dataType) bool) {
@@ -210,7 +257,7 @@ func (g *Gonk[dataType]) insert(data dataType) *dataType {
 
 	backing := g.getBacking()
 
-	for backing == nil || int(atomic.LoadUint32(&backing.maxTotal)) == len(backing.data) {
+	for backing == nil || int(atomic.LoadUint32(&backing.maxTotal)) == cap(backing.data) {
 		g.maintainBacking(Grow)
 		backing = g.getBacking()
 	}
@@ -284,9 +331,24 @@ func (g *Gonk[dataType]) maintainBacking(requestedModification sizeModifierFlag)
 	var newLength int
 	switch requestedModification {
 	case Grow:
-		growSize := oldMax / 2
-		if growSize > 2048 {
-			growSize = 2048
+		var growSize int
+		switch g.growstrategy {
+		case OneAtATime:
+			growSize = 1
+		case FourItems:
+			growSize = 4
+		case Double:
+			growSize = oldMax
+		case Half:
+			growSize = oldMax / 2
+		case HalfMax2048:
+			growSize = oldMax / 2
+			if growSize > 2048 {
+				growSize = 2048
+			}
+		}
+		if growSize < 2 {
+			growSize = 2
 		}
 		newLength = oldMax + growSize
 	case Same:
