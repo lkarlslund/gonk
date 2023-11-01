@@ -202,6 +202,7 @@ func (g *Gonk[dataType]) AtomicMutate(target dataType, mf func(item *dataType), 
 	// Not found
 	if !insertIfNotFound {
 		// Not asked to insert it
+		g.mu.RUnlock()
 		return
 	}
 
