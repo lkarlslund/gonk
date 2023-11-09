@@ -242,8 +242,7 @@ func (g *Gonk[dataType]) AtomicMutate(target dataType, mf func(item *dataType), 
 		return
 	}
 
-	var newitem dataType
-	item := g.insert(newitem)
+	item := g.insert(target)
 	mf(item)
 
 	g.mu.Unlock()
