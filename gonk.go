@@ -23,14 +23,14 @@ type Evaluable[dataType any] interface {
 
 type Backing[dataType Evaluable[dataType]] struct {
 	data     []BackingData[dataType]
-	maxClean uint32 // Not atomic, this is always only being read (number of sorted items)
-	maxTotal uint32 // Number of total items
-	deleted  uint32 // Number of deleted items
-	lookups  uint32 // Number of lookups since created
+	maxClean uint32        // Not atomic, this is always only being read (number of sorted items)
+	maxTotal atomic.Uint32 // Number of total items
+	deleted  atomic.Uint32 // Number of deleted items
+	lookups  atomic.Uint32 // Number of lookups since created
 }
 
 type BackingData[dataType Evaluable[dataType]] struct {
-	alive uint32
+	alive atomic.Uint32
 	item  dataType
 }
 
@@ -61,7 +61,7 @@ func (g *Gonk[dataType]) Init(preloadSize int) {
 	newBacking := Backing[dataType]{
 		data: make([]BackingData[dataType], preloadSize),
 	}
-	if atomic.CompareAndSwapPointer(&g.backing, unsafe.Pointer(uintptr(0)), unsafe.Pointer(&newBacking)) {
+	if atomic.CompareAndSwapPointer(&g.backing, unsafe.Pointer(nil), unsafe.Pointer(&newBacking)) {
 		g.init()
 	}
 	g.mu.Unlock()
@@ -92,14 +92,14 @@ func (g *Gonk[dataType]) Range(af func(item dataType) bool) {
 	if backing == nil {
 		return
 	}
-	last := int(atomic.LoadUint32(&backing.maxTotal))
+	last := int(backing.maxTotal.Load())
 	if last == 0 {
 		return
 	}
 
 	data := backing.data[:last]
 	for i := range data {
-		if atomic.LoadUint32(&data[i].alive) == 1 {
+		if data[i].alive.Load() == 1 {
 			if !af(data[i].item) {
 				break
 			}
@@ -114,12 +114,12 @@ func (g *Gonk[dataType]) getBacking() *Backing[dataType] {
 func (g *Gonk[dataType]) search(key dataType) *BackingData[dataType] {
 	backing := g.getBacking()
 	if backing != nil {
-		atomic.AddUint32(&backing.lookups, 1)
+		backing.lookups.Add(1)
 		n, found := g.sorter.BinarySearch(backing.data[:backing.maxClean], BackingData[dataType]{item: key})
 		if found {
 			return &backing.data[n]
 		}
-		max := atomic.LoadUint32(&backing.maxTotal)
+		max := backing.maxTotal.Load()
 		for i := backing.maxClean; i < max; i++ {
 			// !a<b && !b<a == EQUALS
 			if !backing.data[i].item.LessThan(key) && !key.LessThan(backing.data[i].item) {
@@ -134,9 +134,9 @@ func (g *Gonk[dataType]) Delete(item dataType) bool {
 	g.mu.RLock()
 	dataItem := g.search(item)
 	if dataItem != nil {
-		if atomic.CompareAndSwapUint32(&dataItem.alive, 1, 0) {
+		if dataItem.alive.CompareAndSwap(1, 0) {
 			backing := g.getBacking()
-			atomic.AddUint32(&backing.deleted, 1)
+			backing.deleted.Add(1)
 			g.mu.RUnlock()
 			g.autooptimize()
 			return true
@@ -153,18 +153,18 @@ func (g *Gonk[dataType]) Len() int {
 		return 0
 	}
 
-	return int(atomic.LoadUint32(&backing.maxTotal) - atomic.LoadUint32(&backing.deleted))
+	return int(backing.maxTotal.Load() - backing.deleted.Load())
 }
 
-func (g *Gonk[dataType]) preciseLen() int {
+func (g *Gonk[dataType]) PreciseLen() int {
 	backing := g.getBacking()
 	if backing == nil {
 		return 0
 	}
 	var length int
-	max := int(atomic.LoadUint32(&backing.maxTotal))
+	max := int(backing.maxTotal.Load())
 	for i := 0; i < max && i < len(backing.data); /* BCE */ i++ {
-		if atomic.LoadUint32(&backing.data[i].alive) == 1 {
+		if backing.data[i].alive.Load() == 1 {
 			length++
 		}
 	}
@@ -192,9 +192,9 @@ func (g *Gonk[dataType]) AtomicMutate(target dataType, mf func(item *dataType), 
 	dataItem := g.search(target)
 	if dataItem != nil {
 		mf(&dataItem.item)
-		if atomic.CompareAndSwapUint32(&dataItem.alive, 0, 1) {
+		if dataItem.alive.CompareAndSwap(0, 1) {
 			backing := g.getBacking()
-			atomic.AddUint32(&backing.deleted, ^uint32(0))
+			backing.deleted.Add(^uint32(0))
 		}
 		g.mu.RUnlock()
 		return
@@ -209,7 +209,7 @@ func (g *Gonk[dataType]) AtomicMutate(target dataType, mf func(item *dataType), 
 	oldBacking := g.getBacking()
 	var oldMax uint32
 	if oldBacking != nil {
-		oldMax = atomic.LoadUint32(&oldBacking.maxTotal)
+		oldMax = oldBacking.maxTotal.Load()
 	}
 
 	g.mu.RUnlock()
@@ -220,7 +220,7 @@ func (g *Gonk[dataType]) AtomicMutate(target dataType, mf func(item *dataType), 
 	newBacking := g.getBacking()
 	if oldBacking == newBacking && newBacking != nil {
 		// Only a few was inserted, so just search those
-		newMax := atomic.LoadUint32(&newBacking.maxTotal)
+		newMax := newBacking.maxTotal.Load()
 
 		for i := oldMax; i < newMax; i++ {
 			if !newBacking.data[i].item.LessThan(target) && !target.LessThan(newBacking.data[i].item) {
@@ -234,9 +234,9 @@ func (g *Gonk[dataType]) AtomicMutate(target dataType, mf func(item *dataType), 
 
 	if dataItem != nil {
 		mf(&dataItem.item)
-		if atomic.CompareAndSwapUint32(&dataItem.alive, 0, 1) {
+		if dataItem.alive.CompareAndSwap(0, 1) {
 			backing := g.getBacking()
-			atomic.AddUint32(&backing.deleted, ^uint32(0))
+			backing.deleted.Add(^uint32(0))
 		}
 		g.mu.Unlock()
 		return
@@ -250,20 +250,16 @@ func (g *Gonk[dataType]) AtomicMutate(target dataType, mf func(item *dataType), 
 }
 
 func (g *Gonk[dataType]) insert(data dataType) *dataType {
-	newDataItem := BackingData[dataType]{
-		alive: 1,
-		item:  data,
-	}
-
 	backing := g.getBacking()
 
-	for backing == nil || int(atomic.LoadUint32(&backing.maxTotal)) == cap(backing.data) {
+	for backing == nil || int(backing.maxTotal.Load()) == cap(backing.data) {
 		g.maintainBacking(Grow)
 		backing = g.getBacking()
 	}
 
-	newMax := atomic.AddUint32(&backing.maxTotal, 1)
-	backing.data[int(newMax-1)] = newDataItem
+	newMax := backing.maxTotal.Add(1)
+	backing.data[int(newMax-1)].item = data
+	backing.data[int(newMax-1)].alive.Store(1)
 
 	return &backing.data[int(newMax-1)].item
 }
@@ -274,15 +270,25 @@ func (g *Gonk[dataType]) autooptimize() {
 		return
 	}
 
-	dirtyCount := atomic.LoadUint32(&backing.maxTotal) - atomic.LoadUint32(&backing.maxClean)
-	lookups := atomic.LoadUint32(&backing.lookups)
+	dirtyCount := backing.maxTotal.Load() - atomic.LoadUint32(&backing.maxClean)
+	lookups := backing.lookups.Load()
 
 	if dirtyCount > 64 && lookups*dirtyCount > 1<<24 { // More than 1<<20 (16m) wasted loops
+		// Auto reindex
 		g.mu.Lock()
 		maybeNewbacking := g.getBacking()
 		if maybeNewbacking == backing {
 			// should we optimize?
 			g.maintainBacking(Same)
+		}
+		g.mu.Unlock()
+	} else if backing.deleted.Load()*4 > backing.maxTotal.Load() {
+		// Auto shrink if 25% or more have been deleted
+		g.mu.Lock()
+		maybeNewbacking := g.getBacking()
+		if maybeNewbacking == backing {
+			// should we optimize?
+			g.maintainBacking(Minimize)
 		}
 		g.mu.Unlock()
 	}
@@ -305,7 +311,7 @@ const (
 func (g *Gonk[dataType]) maintainBacking(requestedModification sizeModifierFlag) {
 	oldBacking := g.getBacking()
 
-	if requestedModification == Same && (oldBacking == nil || oldBacking.maxClean == oldBacking.maxTotal) {
+	if requestedModification == Same && (oldBacking == nil || oldBacking.maxClean == oldBacking.maxTotal.Load()) {
 		// Already optimal
 		return
 	}
@@ -325,9 +331,9 @@ func (g *Gonk[dataType]) maintainBacking(requestedModification sizeModifierFlag)
 		return
 	}
 
-	oldMax := int(atomic.LoadUint32(&oldBacking.maxTotal))
+	oldMax := int(oldBacking.maxTotal.Load())
 	oldClean := int(oldBacking.maxClean)
-	oldDeleted := int(atomic.LoadUint32(&oldBacking.deleted))
+	oldDeleted := int(oldBacking.deleted.Load())
 	var newLength int
 	switch requestedModification {
 	case Grow:
@@ -371,11 +377,12 @@ func (g *Gonk[dataType]) maintainBacking(requestedModification sizeModifierFlag)
 		} else {
 			// Pick non-deleted items one by one
 			for i := range oldDirtyData {
-				if oldDirtyData[i].alive == 0 {
+				if oldDirtyData[i].alive.Load() == 0 {
 					continue
 				}
 				insertStart--
-				newData[insertStart] = oldDirtyData[i]
+				newData[insertStart].item = oldDirtyData[i].item
+				newData[insertStart].alive.Store(1)
 			}
 		}
 
@@ -389,15 +396,17 @@ func (g *Gonk[dataType]) maintainBacking(requestedModification sizeModifierFlag)
 		fixData := newData[:insertEnd]
 		insertData := newData[insertStart:insertEnd]
 		for oc, f, i := 0, 0, 0; oc < len(oldCleanData); {
-			if oldCleanData[oc].alive == 0 {
+			if oldCleanData[oc].alive.Load() == 0 {
 				oc++
 				continue
 			}
 			if i < len(insertedData) && insertedData[i].item.LessThan(oldCleanData[oc].item) {
-				fixData[f] = insertData[i]
+				fixData[f].item = insertData[i].item
+				fixData[f].alive.Store(1)
 				i++
 			} else {
-				fixData[f] = oldCleanData[oc]
+				fixData[f].item = oldCleanData[oc].item
+				fixData[f].alive.Store(1)
 				oc++
 			}
 			f++
@@ -406,14 +415,14 @@ func (g *Gonk[dataType]) maintainBacking(requestedModification sizeModifierFlag)
 		newBacking := Backing[dataType]{
 			data:     newData,
 			maxClean: uint32(insertEnd),
-			maxTotal: uint32(insertEnd),
 		}
+		newBacking.maxTotal.Store(uint32(insertEnd))
 
 		if !atomic.CompareAndSwapPointer(&g.backing, unsafe.Pointer(oldBacking), unsafe.Pointer(&newBacking)) {
 			panic("Backing was changed behind my back")
 		}
 	} else {
-		if !atomic.CompareAndSwapPointer(&g.backing, unsafe.Pointer(oldBacking), unsafe.Pointer(uintptr(0))) {
+		if !atomic.CompareAndSwapPointer(&g.backing, unsafe.Pointer(oldBacking), unsafe.Pointer(nil)) {
 			panic("Backing was changed behind my back")
 		}
 	}
