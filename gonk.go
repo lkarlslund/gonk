@@ -78,6 +78,10 @@ func (g *Gonk[dataType]) BulkLoad(items []dataType) {
 		data:     make([]BackingData[dataType], len(items)),
 		maxClean: uint32(len(items)),
 	}
+	for i := range items {
+		newBacking.data[i].item = items[i]
+		newBacking.data[i].alive.Store(1)
+	}
 	newBacking.maxTotal.Store(uint32(len(items)))
 
 	if atomic.CompareAndSwapPointer(&g.backing, unsafe.Pointer(nil), unsafe.Pointer(&newBacking)) {
