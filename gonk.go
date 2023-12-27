@@ -67,6 +67,26 @@ func (g *Gonk[dataType]) Init(preloadSize int) {
 	g.mu.Unlock()
 }
 
+func (g *Gonk[dataType]) BulkLoad(items []dataType) {
+	oldBacking := g.getBacking()
+	if oldBacking != nil {
+		// That's too late
+		return
+	}
+	g.mu.Lock()
+	newBacking := Backing[dataType]{
+		data:     make([]BackingData[dataType], len(items)),
+		maxClean: uint32(len(items)),
+	}
+	newBacking.maxTotal.Store(uint32(len(items)))
+
+	if atomic.CompareAndSwapPointer(&g.backing, unsafe.Pointer(nil), unsafe.Pointer(&newBacking)) {
+		g.init()
+		g.sorter.Sort(newBacking.data)
+	}
+	g.mu.Unlock()
+}
+
 func (g *Gonk[dataType]) init() {
 	g.sorter = slices.Order[BackingData[dataType]]{
 		RefLess: func(a, b *BackingData[dataType]) bool {
