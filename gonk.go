@@ -1,24 +1,30 @@
 package gonk
 
 import (
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/peterrk/slices"
+	"slices"
 )
 
+var (
+	mutexes         []sync.RWMutex
+	growstrategy    GrowStrategy    = FourItems
+	reindexstrategy ReindexStrategy = OnGet
+)
+
+func init() {
+	mutexes = make([]sync.RWMutex, runtime.NumCPU())
+}
+
 type Gonk[dataType Evaluable[dataType]] struct {
-	backing         unsafe.Pointer
-	sorter          slices.Order[BackingData[dataType]]
-	mu              sync.RWMutex
-	growing         atomic.Uint32
-	growstrategy    GrowStrategy
-	reindexstrategy ReindexStrategy
+	backing atomic.Pointer[Backing[dataType]]
 }
 
 type Evaluable[dataType any] interface {
-	LessThan(otherEvaluable dataType) bool
+	Compare(otherEvaluable dataType) int
 }
 
 type Backing[dataType Evaluable[dataType]] struct {
@@ -26,7 +32,7 @@ type Backing[dataType Evaluable[dataType]] struct {
 	maxClean uint32        // Not atomic, this is always only being read (number of sorted items)
 	maxTotal atomic.Uint32 // Number of total items
 	deleted  atomic.Uint32 // Number of deleted items
-	lookups  atomic.Uint32 // Number of lookups since created
+	lookups  atomic.Uint32 // Number of serial lookups since created (i.e. not binary searches)
 }
 
 type BackingData[dataType Evaluable[dataType]] struct {
@@ -51,29 +57,34 @@ const (
 	OnGet
 )
 
+// Get one of the shared mutexes
+func (g *Gonk[dataType]) mu() *sync.RWMutex {
+	return &mutexes[int(uintptr(unsafe.Pointer(g))/unsafe.Sizeof(*g))%len(mutexes)]
+}
+
 func (g *Gonk[dataType]) Init(preloadSize int) {
 	oldBacking := g.getBacking()
 	if oldBacking != nil {
 		// That's too late
 		return
 	}
-	g.mu.Lock()
+	g.mu().Lock()
 	newBacking := Backing[dataType]{
 		data: make([]BackingData[dataType], preloadSize),
 	}
-	if atomic.CompareAndSwapPointer(&g.backing, unsafe.Pointer(nil), unsafe.Pointer(&newBacking)) {
+	if g.backing.CompareAndSwap(nil, &newBacking) {
 		g.init()
 	}
-	g.mu.Unlock()
+	g.mu().Unlock()
 }
 
 func (g *Gonk[dataType]) BulkLoad(items []dataType) {
 	oldBacking := g.getBacking()
 	if oldBacking != nil {
 		// That's too late
-		return
+		panic("gonk: BulkLoad called after init or insertions")
 	}
-	g.mu.Lock()
+	g.mu().Lock()
 	newBacking := Backing[dataType]{
 		data:     make([]BackingData[dataType], len(items)),
 		maxClean: uint32(len(items)),
@@ -84,31 +95,22 @@ func (g *Gonk[dataType]) BulkLoad(items []dataType) {
 	}
 	newBacking.maxTotal.Store(uint32(len(items)))
 
-	if atomic.CompareAndSwapPointer(&g.backing, unsafe.Pointer(nil), unsafe.Pointer(&newBacking)) {
+	if g.backing.CompareAndSwap(nil, &newBacking) {
 		g.init()
-		g.sorter.Sort(newBacking.data)
+		slices.SortFunc(newBacking.data, func(a, b BackingData[dataType]) int { return a.item.Compare(b.item) })
 	}
-	g.mu.Unlock()
+	g.mu().Unlock()
 }
 
 func (g *Gonk[dataType]) init() {
-	g.sorter = slices.Order[BackingData[dataType]]{
-		RefLess: func(a, b *BackingData[dataType]) bool {
-			return a.item.LessThan(b.item)
-		},
-	}
 }
 
-func (g *Gonk[dataType]) GrowStrategy(gs GrowStrategy) {
-	g.mu.Lock()
-	g.growstrategy = gs
-	g.mu.Unlock()
+func SetGrowStrategy(gs GrowStrategy) {
+	growstrategy = gs
 }
 
-func (g *Gonk[dataType]) ReindexStrategy(rs ReindexStrategy) {
-	g.mu.Lock()
-	g.reindexstrategy = rs
-	g.mu.Unlock()
+func SetReindexStrategy(rs ReindexStrategy) {
+	reindexstrategy = rs
 }
 
 func (g *Gonk[dataType]) Range(af func(item dataType) bool) {
@@ -132,43 +134,68 @@ func (g *Gonk[dataType]) Range(af func(item dataType) bool) {
 }
 
 func (g *Gonk[dataType]) getBacking() *Backing[dataType] {
-	return (*Backing[dataType])(atomic.LoadPointer(&g.backing))
+	return g.backing.Load()
 }
 
-func (g *Gonk[dataType]) search(key dataType) *BackingData[dataType] {
+func (g *Gonk[dataType]) search(key dataType) (result *BackingData[dataType]) {
 	backing := g.getBacking()
+	var lookups int
+	var max uint32
+
 	if backing != nil {
-		backing.lookups.Add(1)
-		n, found := g.sorter.BinarySearch(backing.data[:backing.maxClean], BackingData[dataType]{item: key})
+		// n, found := slices.BinarySearchFunc(backing.data[:backing.maxClean], BackingData[dataType]{item: key}, func(a, b BackingData[dataType]) int {
+		n, found := g.binarysearch(backing.data[:backing.maxClean], key)
 		if found {
 			return &backing.data[n]
 		}
-		max := backing.maxTotal.Load()
+		max = backing.maxTotal.Load()
 		for i := backing.maxClean; i < max; i++ {
 			// !a<b && !b<a == EQUALS
-			if !backing.data[i].item.LessThan(key) && !key.LessThan(backing.data[i].item) {
-				return &backing.data[i]
+			lookups++
+			if backing.data[i].item.Compare(key) == 0 {
+				result = &backing.data[i]
+				break
 			}
 		}
+		if lookups > 0 {
+			backing.lookups.Add(uint32(lookups))
+		}
 	}
-	return nil
+	return
+}
+
+func (g *Gonk[dataType]) binarysearch(b []BackingData[dataType], target dataType) (int, bool) {
+	n := len(b)
+	// Define cmp(x[-1], target) < 0 and cmp(x[n], target) >= 0 .
+	// Invariant: cmp(x[i - 1], target) < 0, cmp(x[j], target) >= 0.
+	i, j := 0, n
+	for i < j {
+		h := int(uint(i+j) >> 1) // avoid overflow when computing h
+		// i ≤ h < j
+		if b[h].item.Compare(target) < 0 {
+			i = h + 1 // preserves cmp(x[i - 1], target) < 0
+		} else {
+			j = h // preserves cmp(x[j], target) >= 0
+		}
+	}
+	// i == j, cmp(x[i-1], target) < 0, and cmp(x[j], target) (= cmp(x[i], target)) >= 0  =>  answer is i.
+	return i, i < n && b[i].item.Compare(target) == 0
 }
 
 func (g *Gonk[dataType]) Delete(item dataType) bool {
-	g.mu.RLock()
+	g.mu().RLock()
 	dataItem := g.search(item)
+	var found bool
 	if dataItem != nil {
 		if dataItem.alive.CompareAndSwap(1, 0) {
 			backing := g.getBacking()
 			backing.deleted.Add(1)
-			g.mu.RUnlock()
-			g.autooptimize()
-			return true
+			found = true
 		}
 	}
-	g.mu.RUnlock()
+	g.mu().RUnlock()
 	g.autooptimize()
-	return false
+	return found
 }
 
 func (g *Gonk[dataType]) Len() int {
@@ -196,9 +223,9 @@ func (g *Gonk[dataType]) PreciseLen() int {
 }
 
 func (g *Gonk[dataType]) Load(target dataType) (dataType, bool) {
-	g.mu.RLock()
+	g.mu().RLock()
 	dataItem := g.search(target)
-	g.mu.RUnlock()
+	g.mu().RUnlock()
 	if dataItem == nil {
 		return *new(dataType), false
 	}
@@ -212,7 +239,7 @@ func (g *Gonk[dataType]) Store(target dataType) {
 }
 
 func (g *Gonk[dataType]) AtomicMutate(target dataType, mf func(item *dataType), insertIfNotFound bool) {
-	g.mu.RLock()
+	g.mu().RLock()
 	dataItem := g.search(target)
 	if dataItem != nil {
 		mf(&dataItem.item)
@@ -220,13 +247,13 @@ func (g *Gonk[dataType]) AtomicMutate(target dataType, mf func(item *dataType), 
 			backing := g.getBacking()
 			backing.deleted.Add(^uint32(0))
 		}
-		g.mu.RUnlock()
+		g.mu().RUnlock()
 		return
 	}
 	// Not found
 	if !insertIfNotFound {
 		// Not asked to insert it
-		g.mu.RUnlock()
+		g.mu().RUnlock()
 		return
 	}
 
@@ -236,9 +263,9 @@ func (g *Gonk[dataType]) AtomicMutate(target dataType, mf func(item *dataType), 
 		oldMax = oldBacking.maxTotal.Load()
 	}
 
-	g.mu.RUnlock()
+	g.mu().RUnlock()
 
-	g.mu.Lock()
+	g.mu().Lock()
 
 	// There was someone else doing changes, maybe they inserted it?
 	newBacking := g.getBacking()
@@ -247,7 +274,7 @@ func (g *Gonk[dataType]) AtomicMutate(target dataType, mf func(item *dataType), 
 		newMax := newBacking.maxTotal.Load()
 
 		for i := oldMax; i < newMax; i++ {
-			if !newBacking.data[i].item.LessThan(target) && !target.LessThan(newBacking.data[i].item) {
+			if newBacking.data[i].item.Compare(target) == 0 {
 				dataItem = &newBacking.data[i]
 			}
 		}
@@ -262,14 +289,14 @@ func (g *Gonk[dataType]) AtomicMutate(target dataType, mf func(item *dataType), 
 			backing := g.getBacking()
 			backing.deleted.Add(^uint32(0))
 		}
-		g.mu.Unlock()
+		g.mu().Unlock()
 		return
 	}
 
 	item := g.insert(target)
 	mf(item)
 
-	g.mu.Unlock()
+	g.mu().Unlock()
 	g.autooptimize()
 }
 
@@ -299,29 +326,29 @@ func (g *Gonk[dataType]) autooptimize() {
 
 	if dirtyCount > 64 && lookups*dirtyCount > 1<<24 { // More than 1<<20 (16m) wasted loops
 		// Auto reindex
-		g.mu.Lock()
+		g.mu().Lock()
 		maybeNewbacking := g.getBacking()
 		if maybeNewbacking == backing {
 			// should we optimize?
 			g.maintainBacking(Same)
 		}
-		g.mu.Unlock()
+		g.mu().Unlock()
 	} else if backing.deleted.Load()*4 > backing.maxTotal.Load() {
 		// Auto shrink if 25% or more have been deleted
-		g.mu.Lock()
+		g.mu().Lock()
 		maybeNewbacking := g.getBacking()
 		if maybeNewbacking == backing {
 			// should we optimize?
 			g.maintainBacking(Minimize)
 		}
-		g.mu.Unlock()
+		g.mu().Unlock()
 	}
 }
 
 func (g *Gonk[dataType]) Optimize(requiredModification sizeModifierFlag) {
-	g.mu.Lock()
+	g.mu().Lock()
 	g.maintainBacking(requiredModification)
-	g.mu.Unlock()
+	g.mu().Unlock()
 }
 
 type sizeModifierFlag uint8
@@ -340,18 +367,13 @@ func (g *Gonk[dataType]) maintainBacking(requestedModification sizeModifierFlag)
 		return
 	}
 
-	if !g.growing.CompareAndSwap(0, 1) {
-		panic("growing twice")
-	}
-
 	if oldBacking == nil {
 		// first time we're getting dirty around there
 		g.init()
 		newBacking := Backing[dataType]{
 			data: make([]BackingData[dataType], 4),
 		}
-		atomic.StorePointer(&g.backing, unsafe.Pointer(&newBacking))
-		g.growing.Store(0)
+		g.backing.Store(&newBacking)
 		return
 	}
 
@@ -362,7 +384,7 @@ func (g *Gonk[dataType]) maintainBacking(requestedModification sizeModifierFlag)
 	switch requestedModification {
 	case Grow:
 		var growSize int
-		switch g.growstrategy {
+		switch growstrategy {
 		case OneAtATime:
 			growSize = 1
 		case FourItems:
@@ -413,7 +435,7 @@ func (g *Gonk[dataType]) maintainBacking(requestedModification sizeModifierFlag)
 		// Sort the new items
 		insertedData := newData[insertStart:insertEnd]
 
-		g.sorter.Sort(insertedData)
+		slices.SortFunc(insertedData, func(a, b BackingData[dataType]) int { return a.item.Compare(b.item) })
 
 		// Merge old and new
 		oldCleanData := oldBacking.data[:int(oldBacking.maxClean)]
@@ -424,7 +446,7 @@ func (g *Gonk[dataType]) maintainBacking(requestedModification sizeModifierFlag)
 				oc++
 				continue
 			}
-			if i < len(insertedData) && insertedData[i].item.LessThan(oldCleanData[oc].item) {
+			if i < len(insertedData) && insertedData[i].item.Compare(oldCleanData[oc].item) < 0 { // Less than
 				fixData[f].item = insertData[i].item
 				fixData[f].alive.Store(1)
 				i++
@@ -442,13 +464,12 @@ func (g *Gonk[dataType]) maintainBacking(requestedModification sizeModifierFlag)
 		}
 		newBacking.maxTotal.Store(uint32(insertEnd))
 
-		if !atomic.CompareAndSwapPointer(&g.backing, unsafe.Pointer(oldBacking), unsafe.Pointer(&newBacking)) {
+		if !g.backing.CompareAndSwap(oldBacking, &newBacking) {
 			panic("Backing was changed behind my back")
 		}
 	} else {
-		if !atomic.CompareAndSwapPointer(&g.backing, unsafe.Pointer(oldBacking), unsafe.Pointer(nil)) {
+		if !g.backing.CompareAndSwap(oldBacking, nil) {
 			panic("Backing was changed behind my back")
 		}
 	}
-	g.growing.Store(0)
 }
