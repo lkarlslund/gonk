@@ -20,6 +20,7 @@ func init() {
 }
 
 type Gonk[dataType Evaluable[dataType]] struct {
+	blank   dataType
 	backing atomic.Pointer[Backing[dataType]]
 }
 
@@ -226,8 +227,8 @@ func (g *Gonk[dataType]) Load(target dataType) (dataType, bool) {
 	g.mu().RLock()
 	dataItem := g.search(target)
 	g.mu().RUnlock()
-	if dataItem == nil {
-		return *new(dataType), false
+	if dataItem == nil || dataItem.alive.Load() != 1 {
+		return g.blank, false
 	}
 	return dataItem.item, true
 }
