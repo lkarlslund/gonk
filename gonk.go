@@ -114,7 +114,37 @@ func SetReindexStrategy(rs ReindexStrategy) {
 	reindexstrategy = rs
 }
 
-func (g *Gonk[dataType]) Range(af func(item dataType) bool) {
+func (g *Gonk[dataType]) RangeFrom(item dataType, af func(item dataType) bool) {
+	backing := g.getBacking()
+	if backing == nil {
+		return
+	}
+	last := int(backing.maxTotal.Load())
+	if last == 0 {
+		return
+	}
+
+	if last < int(backing.maxClean) {
+		// Sort items
+		g.mu().Lock()
+		g.maintainBacking(Same)
+		g.mu().Unlock()
+		backing = g.getBacking()
+		last = int(backing.maxClean)
+	}
+
+	first, _ := g.binarysearch(backing.data[:last], item)
+
+	for i := first; i <= last; i++ {
+		if backing.data[i].alive.Load() == 1 {
+			if !af(backing.data[i].item) {
+				break
+			}
+		}
+	}
+}
+
+func (g *Gonk[dataType]) Range(af func(item *dataType) bool) {
 	backing := g.getBacking()
 	if backing == nil {
 		return
@@ -127,7 +157,7 @@ func (g *Gonk[dataType]) Range(af func(item dataType) bool) {
 	data := backing.data[:last]
 	for i := range data {
 		if data[i].alive.Load() == 1 {
-			if !af(data[i].item) {
+			if !af(&data[i].item) {
 				break
 			}
 		}
